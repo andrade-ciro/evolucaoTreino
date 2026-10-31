@@ -94,16 +94,17 @@ body.flash #flash{animation:fl .4s steps(1) 7}
 <div id="toast"></div>
 <script>
 'use strict';
-const VERSAO = '1.0.0';
+const VERSAO = '1.2.0';
 
 // <núcleo> — funções puras, sem DOM; testadas por ?test e por testes/rodar.js
 const DEF = { descanso_padrao_s: 90, aviso_antecipado_s: 10, series_padrao: 3, reps_min_padrao: 8, reps_max_padrao: 12, historico_sessoes: 5 };
 const EQUIP = { barra: 'Barra', halter: 'Halter', maquina: 'Máquina', cabo: 'Cabo', peso_corporal: 'Peso corporal' };
 const INC_PADRAO = { barra: 2.5, halter: 2, maquina: 5, cabo: 2.5, peso_corporal: 2.5 };
 const COLS = {
-  Sessoes: ['sessao_id', 'plano_id', 'plano_nome', 'inicio', 'fim', 'duracao_s', 'encerramento', 'series_planejadas', 'series_feitas', 'volume_kg', 'obs'],
+  Sessoes: ['sessao_id', 'plano_id', 'plano_nome', 'inicio', 'fim', 'duracao_s', 'pausa_s', 'encerramento', 'series_planejadas', 'series_feitas', 'volume_kg', 'obs'],
   Series: ['serie_id', 'sessao_id', 'exercicio_id', 'ordem_exercicio', 'n_serie', 'aquecimento', 'peso_kg', 'reps', 'rir',
     'sugerido_peso_kg', 'sugerido_reps', 'descanso_real_s', 'registrado_em'],
+  PlanoItens: ['plano_id', 'ordem', 'exercicio_id', 'series', 'reps_min', 'reps_max', 'descanso_s', 'obs'],
 };
 
 function num(x) {
@@ -219,6 +220,28 @@ function atualizarRecorde(rec, series, data) {
   }
   return rec;
 }
+
+function pick(obj, cols) {
+  const o = {};
+  for (const c of cols) if (obj[c] !== undefined) o[c] = obj[c];
+  return o;
+}
+
+/** Tempo de treino em ms, descontando as pausas. */
+function tempoAtivo(s, agora) {
+  return Math.max(0, (s.fim || s.pausadoEm || agora) - s.inicio - (s.pausaTotal || 0));
+}
+
+/** Operações que levam a planilha das séries `atuais` de volta às séries `alvo` (usado no desfazer). */
+function opsParaReverter(atuais, alvo, cols, chave = 'serie_id') {
+  const ops = [], porId = new Map(atuais.map(x => [x[chave], x])), ids = new Set(alvo.map(x => x[chave]));
+  for (const x of atuais) if (!ids.has(x[chave])) ops.push({ op: 'delete', id: x[chave] });
+  for (const x of alvo) {
+    const a = porId.get(x[chave]), d = pick(x, cols);
+    if (!a || JSON.stringify(pick(a, cols)) !== JSON.stringify(d)) ops.push({ op: 'upsert', id: x[chave], dados: d });
+  }
+  return ops;
+}
 // </núcleo>
 
 // ---------------------------------------------------------------- utilidades de DOM
@@ -243,12 +266,6 @@ function toast(msg) {
   clearTimeout(toast.t);
   toast.t = setTimeout(() => t.classList.remove('on'), 2800);
 }
-function pick(obj, cols) {
-  const o = {};
-  for (const c of cols) if (obj[c] !== undefined) o[c] = obj[c];
-  return o;
-}
-
 // ---------------------------------------------------------------- armazenamento local (RT-06)
 const LS = {
   get(k, d) { try { const v = localStorage.getItem('treino.' + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
@@ -364,8 +381,9 @@ async function carregarDados(silencioso) {
   atualizarBadge();
 }
 
-function badgeTxt() {
+function badgeTxt(compacto) {
   const n = S.fila.length;
+  if (compacto) return `<span class="dot ${!S.cfg.url || S.sync.erro ? 'err' : n ? 'warn' : ''}"></span>${n || '✓'}`;
   if (!S.cfg.url) return '<span class="dot err"></span>não configurado';
   if (S.sync.ocupado) return `<span class="dot warn"></span>enviando ${n}…`;
   if (!navigator.onLine && n) return `<span class="dot warn"></span>offline · ${n} pendente${n > 1 ? 's' : ''}`;
@@ -373,8 +391,8 @@ function badgeTxt() {
   if (n) return `<span class="dot warn"></span>${n} pendente${n > 1 ? 's' : ''}`;
   return '<span class="dot"></span>sincronizado';
 }
-const badgeHtml = () => `<button class="badge" id="badge" data-a="ir" data-h="#/config" aria-label="Estado da sincronização">${badgeTxt()}</button>`;
-function atualizarBadge() { const b = $('#badge'); if (b) b.innerHTML = badgeTxt(); }
+const badgeHtml = compacto => `<button class="badge" id="badge" data-c="${compacto ? 1 : ''}" data-a="ir" data-h="#/config" aria-label="Estado da sincronização">${badgeTxt(compacto)}</button>`;
+function atualizarBadge() { const b = $('#badge'); if (b) b.innerHTML = badgeTxt(!!b.dataset.c); }
 
 // ---------------------------------------------------------------- áudio, vibração, flash, wake lock (RT-04, RT-05)
 const audio = {
@@ -446,7 +464,7 @@ function novoExSessao(exercicio_id, item, extra) {
   if (it.reps_max < it.reps_min) it.reps_max = it.reps_min;
   const hist = (S.cache.historico[exercicio_id] || []).filter(h => !S.sessao || h.sessao_id !== S.sessao.sessao_id);
   return {
-    key: uuid(), exercicio_id, nome: ex.nome || '(exercício removido)', equipamento: ex.equipamento || '',
+    key: uuid(), item_id: item.item_id || null, exercicio_id, nome: ex.nome || '(exercício removido)', equipamento: ex.equipamento || '',
     incremento: num(ex.incremento_kg) || 0, ...it, extra: !!extra, pulado: false, ordemExec: null,
     sugestao: sugerir(hist, it, ex), ultima: hist[0] || null,
     recordeAnterior: S.cache.recordes[exercicio_id] || null,
@@ -463,6 +481,7 @@ function iniciarSessao(planoId) {
     sessao_id: uuid(), plano_id: plano ? plano.plano_id : '', plano_nome: plano ? plano.nome : 'Sessão livre',
     inicio: agora, fim: null, encerramento: null, estado: 'ativa', autoFinalizou: false,
     exercicios: [], atualKey: null, series: [], descanso: null, ordemExec: 0, rascunho: null,
+    pausadoEm: null, pausaTotal: 0, obs: '', desfazer: [],
   };
   S.sessao.exercicios = itens.map(it => novoExSessao(it.exercicio_id, it, false));
   S.sessao.atualKey = S.sessao.exercicios[0] ? S.sessao.exercicios[0].key : null;
@@ -511,8 +530,103 @@ function deveAutoFinalizar(s) {
   return !!s.plano_id && s.series_planejadas > 0 && !s.autoFinalizou && plan.length > 0 && plan.every(concluido);
 }
 
+// ---- pausa
+function retomarPausa() {
+  const s = S.sessao;
+  if (!s || !s.pausadoEm) return;
+  const d = Date.now() - s.pausadoEm;
+  s.pausaTotal = (s.pausaTotal || 0) + d;
+  if (s.descanso) s.descanso.inicio += d; // o descanso também fica congelado durante a pausa
+  s.pausadoEm = null;
+}
+
+// ---- desfazer: cada ação guarda uma foto da sessão; desfazer restaura a foto e reverte a planilha
+const MAX_DESFAZER = 20;
+function fotografar(rotulo, comPlano) {
+  const s = S.sessao;
+  const { desfazer, ...resto } = s;
+  const foto = { rotulo, estado: JSON.stringify(resto) };
+  if (comPlano && s.plano_id) foto.itensPlano = JSON.stringify(itensDoPlano(s.plano_id));
+  s.desfazer = (desfazer || []).concat([foto]).slice(-MAX_DESFAZER);
+}
+
+function desfazer() {
+  const s = S.sessao, pilha = (s && s.desfazer) || [];
+  if (!pilha.length) return;
+  const { rotulo, estado, itensPlano } = pilha[pilha.length - 1];
+  const ant = JSON.parse(estado);
+  opsParaReverter(s.series, ant.series, COLS.Series).forEach(o => enfileirarOp(o.op, 'Series', o.id, o.dados));
+  if (itensPlano) {
+    const alvo = JSON.parse(itensPlano);
+    opsParaReverter(itensDoPlano(s.plano_id), alvo, COLS.PlanoItens, 'item_id').forEach(o => enfileirarOp(o.op, 'PlanoItens', o.id, o.dados));
+    S.cache.itens = S.cache.itens.filter(i => i.plano_id !== s.plano_id).concat(alvo);
+    salvar.cache();
+  }
+  // Pausa e observação não fazem parte do desfazer: durante o treino, mantém o estado atual delas
+  if (ant.estado === 'ativa') {
+    if (ant.descanso) ant.descanso.inicio += (s.pausaTotal || 0) - (ant.pausaTotal || 0);
+    Object.assign(ant, { pausadoEm: s.pausadoEm, pausaTotal: s.pausaTotal || 0 });
+  }
+  Object.assign(ant, { obs: s.obs || '', desfazer: pilha.slice(0, -1) });
+  S.sessao = ant;
+  salvar.sessao();
+  if (ant.estado === 'ativa' && !ant.pausadoEm) wake.ligar();
+  S.ui.modal = null;
+  render();
+  toast('Desfeito: ' + rotulo);
+}
+
+// ---- inserir / alterar / excluir exercício durante o treino
+const prefAplicarPlano = () => LS.get('aplicarNoPlano', true);
+const recalcPlanejadas = s => { s.series_planejadas = s.exercicios.filter(e => !e.extra).reduce((a, e) => a + e.series, 0); };
+
+function gravarItemPlano(it) {
+  upsertLocal('itens', 'item_id', it);
+  enfileirarOp('upsert', 'PlanoItens', it.item_id, pick(it, COLS.PlanoItens));
+}
+
+/** Insere no plano o item do exercício `ex`, logo depois do item do exercício anterior da sessão que está no plano. */
+function inserirNoPlano(s, ex) {
+  const itens = itensDoPlano(s.plano_id);
+  const i = s.exercicios.indexOf(ex);
+  const anterior = s.exercicios.slice(0, i).reverse().find(e => e.item_id && itens.some(it => it.item_id === e.item_id));
+  const pos = anterior ? itens.findIndex(it => it.item_id === anterior.item_id) + 1 : 0;
+  ex.item_id = uuid();
+  itens.splice(pos, 0, { item_id: ex.item_id, plano_id: s.plano_id, exercicio_id: ex.exercicio_id, series: ex.series,
+    reps_min: ex.reps_min, reps_max: ex.reps_max, descanso_s: ex.descanso_s, obs: '' });
+  itens.forEach((it, k) => { if (it.item_id === ex.item_id || num(it.ordem) !== k + 1) gravarItemPlano({ ...it, ordem: k + 1 }); });
+  salvar.cache();
+}
+
+function rascunhoExValido(d) {
+  const v = { series: Math.round(num(d.series) || 0), reps_min: Math.round(num(d.reps_min) || 0),
+    reps_max: Math.round(num(d.reps_max) || 0), descanso_s: Math.round(num(d.descanso_s) ?? -1) };
+  if (v.series < 1 || v.reps_min < 1 || v.descanso_s < 0) { toast('Séries, repetições e descanso inválidos'); return null; }
+  if (v.reps_max < v.reps_min) { toast('Reps máx menor que reps mín'); return null; }
+  return v;
+}
+
+/** Cria uma série no exercício `ex` da sessão e a envia. Usado no registro e no resumo. */
+function criarSerie(ex, v) {
+  const s = S.sessao;
+  if (ex.ordemExec == null) ex.ordemExec = ++s.ordemExec;
+  const w = trabalhoDoEx(ex).length;
+  const serie = {
+    serie_id: uuid(), sessao_id: s.sessao_id, exercicio_id: ex.exercicio_id, ex_key: ex.key,
+    ordem_exercicio: ex.ordemExec, n_serie: Math.max(0, ...seriesDoEx(ex).map(x => x.n_serie)) + 1, aquecimento: !!v.aquecimento,
+    peso_kg: v.peso, reps: v.reps, rir: v.rir,
+    sugerido_peso_kg: v.aquecimento ? null : ex.sugestao.peso,
+    sugerido_reps: v.aquecimento ? null : ex.sugestao.reps[Math.min(w, ex.sugestao.reps.length - 1)],
+    descanso_real_s: null, registrado_em: iso(Date.now()),
+  };
+  s.series.push(serie);
+  enfileirarOp('upsert', 'Series', serie.serie_id, pick(serie, COLS.Series));
+  return serie;
+}
+
 function finalizar(encerramento) {
   const s = S.sessao;
+  retomarPausa();
   s.fim = Date.now();
   s.encerramento = encerramento;
   s.estado = 'resumo';
@@ -523,26 +637,16 @@ function finalizar(encerramento) {
 
 function registrarSerie() {
   const s = S.sessao, ex = exAtual();
-  if (!s || !ex) return;
+  if (!s || !ex || s.pausadoEm) return;
   const r = garantirRascunho(ex);
   const peso = num(r.peso), reps = Math.round(num(r.reps) || 0);
   if (peso == null || peso < 0) { toast('Informe o peso'); $('#in-peso') && $('#in-peso').focus(); return; }
   if (reps < 1) { toast('Informe as repetições'); return; }
   audio.liberar();
+  fotografar(r.aquecimento ? `Aquecimento — ${ex.nome}` : `Série ${trabalhoDoEx(ex).length + 1} — ${ex.nome}`);
   pararDescanso();
-  if (ex.ordemExec == null) ex.ordemExec = ++s.ordemExec;
-  const w = trabalhoDoEx(ex).length;
   const agora = Date.now();
-  const serie = {
-    serie_id: uuid(), sessao_id: s.sessao_id, exercicio_id: ex.exercicio_id, ex_key: ex.key,
-    ordem_exercicio: ex.ordemExec, n_serie: seriesDoEx(ex).length + 1, aquecimento: !!r.aquecimento,
-    peso_kg: peso, reps, rir: r.rir,
-    sugerido_peso_kg: r.aquecimento ? null : ex.sugestao.peso,
-    sugerido_reps: r.aquecimento ? null : ex.sugestao.reps[Math.min(w, ex.sugestao.reps.length - 1)],
-    descanso_real_s: null, registrado_em: iso(agora),
-  };
-  s.series.push(serie);
-  enfileirarOp('upsert', 'Series', serie.serie_id, pick(serie, COLS.Series));
+  const serie = criarSerie(ex, { peso, reps, rir: r.rir, aquecimento: r.aquecimento });
   vibrar(25);
   s.rascunho = null;
 
@@ -565,8 +669,7 @@ function calcResumo(s) {
   const prs = [], porEx = [];
   s.exercicios.forEach(ex => {
     const w = work.filter(x => x.ex_key === ex.key);
-    if (!w.length && !s.series.some(x => x.ex_key === ex.key)) return;
-    porEx.push({ ex, w });
+    porEx.push({ ex, w, todas: s.series.filter(x => x.ex_key === ex.key) });
     if (!w.length) return;
     const ant = ex.recordeAnterior;
     const melhor = w.reduce((a, x) => e1rm(x.peso_kg, x.reps) > e1rm(a.peso_kg, a.reps) ? x : a);
@@ -579,7 +682,7 @@ function calcResumo(s) {
     }
   });
   return {
-    duracao: Math.round(((s.fim || Date.now()) - s.inicio) / 1000),
+    duracao: Math.round(tempoAtivo(s, Date.now()) / 1000), pausa: Math.round((s.pausaTotal || 0) / 1000),
     feitas: work.length, planejadas: s.series_planejadas || 0, volume: arred(volume), prs, porEx,
   };
 }
@@ -607,8 +710,8 @@ function concluirSessao() {
   pararDescanso(false);
   const r = calcResumo(s);
   enfileirarOp('upsert', 'Sessoes', s.sessao_id, {
-    fim: iso(s.fim || Date.now()), duracao_s: r.duracao, encerramento: s.encerramento || 'manual',
-    series_feitas: r.feitas, volume_kg: r.volume,
+    fim: iso(s.fim || Date.now()), duracao_s: r.duracao, pausa_s: r.pausa, encerramento: s.encerramento || 'manual',
+    series_feitas: r.feitas, series_planejadas: s.series_planejadas || 0, volume_kg: r.volume, obs: (s.obs || '').trim(),
   });
   atualizarCacheComSessao(s);
   S.sessao = null;
@@ -626,9 +729,11 @@ function tick() {
   if (!s) return;
   const agora = Date.now();
   const rel = $('#relogio');
-  if (rel) rel.textContent = fmtDur(((s.fim || agora) - s.inicio) / 1000);
+  if (rel) rel.textContent = fmtDur(tempoAtivo(s, agora) / 1000);
+  const pt = $('#pausa-tempo');
+  if (pt && s.pausadoEm) pt.textContent = fmtDur((agora - s.pausadoEm) / 1000);
   const d = s.descanso;
-  if (!d || s.estado !== 'ativa') return;
+  if (!d || s.estado !== 'ativa' || s.pausadoEm) return;
   const total = Math.max(0, d.dur + d.ajuste) * 1000;
   const resta = d.inicio + total - agora;
   const aviso = cfgVal('aviso_antecipado_s') * 1000;
@@ -697,7 +802,7 @@ function telaInicio() {
   if (S.sessao) {
     const s = S.sessao;
     h += `<div class="card"><div class="muted small">Treino em andamento</div><b>${esc(s.plano_nome)}</b>
-      <div class="muted small">desde ${new Date(s.inicio).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })} · ${s.series.length} séries</div>
+      <div class="muted small">desde ${new Date(s.inicio).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })} · ${s.series.length} séries${s.pausadoEm ? ' · <span class="tag warn">pausado</span>' : ''}</div>
       <button class="pri big mt" data-a="ir" data-h="#/sessao">Retomar treino</button></div>`;
     return h + nav('inicio');
   }
@@ -717,12 +822,39 @@ function telaInicio() {
 }
 
 // ---- sessão (RP-07..RP-22)
+function botaoDesfazer() {
+  const p = S.sessao.desfazer || [], rot = p.length ? 'Desfazer: ' + p[p.length - 1].rotulo : 'Nada para desfazer';
+  return `<button data-a="desfazer" ${p.length ? '' : 'disabled'} aria-label="${esc(rot)}" title="${esc(rot)}">↶</button>`;
+}
+
+function barraSessao() {
+  const s = S.sessao;
+  return `<div class="top"><div class="grow"><div class="muted small clamp">${esc(s.plano_nome)}</div><div class="relogio" id="relogio">0:00</div></div>
+    ${badgeHtml(true)}${botaoDesfazer()}
+    <button data-a="${s.pausadoEm ? 'retomar' : 'pausar'}" aria-label="${s.pausadoEm ? 'Retomar treino' : 'Pausar treino'}">${s.pausadoEm ? '▶' : '❚❚'}</button>
+    <button data-a="modal" data-t="menu" aria-label="Menu">⋮</button></div>`;
+}
+
+/** Linha de uma série, tocável para editar. */
+function serieLi(x, doEx) {
+  const n = doEx.filter(y => !y.aquecimento && y.n_serie <= x.n_serie).length;
+  return `<button class="li" data-a="modal" data-t="serie" data-id="${x.serie_id}">
+    <span class="tag ${x.aquecimento ? '' : 'ac'}">${x.aquecimento ? 'aq' : '#' + n}</span>
+    <span class="grow"><b>${fmtKg(x.peso_kg)} kg × ${x.reps}</b>${x.rir != null ? ` <span class="muted small">RIR ${x.rir}</span>` : ''}</span>
+    <span class="muted small">${x.descanso_real_s != null ? '⏱ ' + fmtDur(x.descanso_real_s) : ''} ✎</span></button>`;
+}
+
 function telaSessao() {
   const s = S.sessao;
   if (s.estado === 'resumo') return telaResumo();
   const ex = exAtual();
-  let h = `<div class="top"><div class="grow"><div class="muted small clamp">${esc(s.plano_nome)}</div><div class="relogio" id="relogio">0:00</div></div>
-    ${badgeHtml()}<button data-a="modal" data-t="menu" aria-label="Menu">⋮</button></div>`;
+  let h = barraSessao();
+  if (s.pausadoEm) {
+    return h + `<div class="card center"><div class="muted">Treino pausado há</div><div class="timer-big" id="pausa-tempo">0:00</div>
+      <div class="muted small">A pausa não conta na duração do treino${s.descanso ? ' e o descanso em andamento também fica parado' : ''}.</div></div>
+      ${ex ? `<p class="muted small center">Ao voltar: ${esc(ex.nome)}, série ${trabalhoDoEx(ex).length + 1} de ${ex.series}</p>` : ''}
+      <div class="bottom"><div><button class="okb big" data-a="retomar">▶ Retomar treino</button></div></div>`;
+  }
   if (!ex) {
     return h + `<div class="card center"><p>Nenhum exercício na sessão.</p>
       <button class="pri big" data-a="modal" data-t="picker" data-dest="sessao">+ Adicionar exercício</button></div>`;
@@ -736,7 +868,8 @@ function telaSessao() {
   const tipoPeso = ex.equipamento === 'halter' ? ' · um halter' : ex.equipamento === 'peso_corporal' ? ' · carga adicional' : '';
 
   h += `<div class="card">
-    <button class="exnome" data-a="modal" data-t="exs"><span class="grow clamp">${esc(ex.nome)}</span><span class="muted small">${pos}/${s.exercicios.length} ▾</span></button>
+    <div class="row"><button class="exnome grow" data-a="modal" data-t="exs"><span class="grow clamp">${esc(ex.nome)}</span><span class="muted small">${pos}/${s.exercicios.length} ▾</span></button>
+      <button data-a="modal" data-t="exEdit" data-k="${ex.key}" aria-label="Editar exercício">✎</button></div>
     <div class="serieinfo">${w >= ex.series ? `<span class="tag warn">extra</span> Série ${w + 1} (plano: ${ex.series})` : `Série <b>${w + 1}</b> de ${ex.series}`}
       <span class="muted small">· faixa ${ex.reps_min}–${ex.reps_max}${ex.pulado ? ' · <span class="tag">pulado</span>' : ''}</span></div>
     <div class="alvo">Sugestão: <b>${fmtKg(sug.peso)} kg</b> × ${alvo}</div>
@@ -766,11 +899,7 @@ function telaSessao() {
 
   const ss = seriesDoEx(ex);
   if (ss.length) {
-    h += `<div class="card"><div class="muted small">Séries registradas — toque para editar</div>${ss.map(x => `
-      <button class="li" data-a="modal" data-t="serie" data-id="${x.serie_id}">
-        <span class="tag ${x.aquecimento ? '' : 'ac'}">${x.aquecimento ? 'aq' : '#' + ss.filter(y => !y.aquecimento && y.n_serie <= x.n_serie).length}</span>
-        <span class="grow"><b>${fmtKg(x.peso_kg)} kg × ${x.reps}</b>${x.rir != null ? ` <span class="muted small">RIR ${x.rir}</span>` : ''}</span>
-        <span class="muted small">${x.descanso_real_s != null ? '⏱ ' + fmtDur(x.descanso_real_s) : ''}</span></button>`).join('')}</div>`;
+    h += `<div class="card"><div class="muted small">Séries registradas — toque para editar</div>${ss.map(x => serieLi(x, ss)).join('')}</div>`;
   }
   const prox = proximoPendente(s, ex.key);
   if (prox) h += `<p class="muted small center">Próximo: ${esc(prox.nome)}</p>`;
@@ -783,18 +912,22 @@ function telaSessao() {
 // ---- resumo (RP-10, RP-12)
 function telaResumo() {
   const s = S.sessao, r = calcResumo(s);
-  let h = topo('Resumo do treino');
+  let h = `<div class="top"><h1>Resumo do treino</h1>${badgeHtml(true)}${botaoDesfazer()}</div>`;
   h += `<div class="card"><b>${esc(s.plano_nome)}</b> <span class="tag ${s.encerramento === 'auto' ? 'ok' : 'warn'}">${s.encerramento === 'auto' ? 'concluído' : 'encerrado manualmente'}</span>
     <div class="stats mt">
-      <div class="stat"><span class="muted small">Duração</span><b id="relogio">${fmtDur(r.duracao)}</b></div>
+      <div class="stat"><span class="muted small">Duração</span><b id="relogio">${fmtDur(r.duracao)}</b>${r.pausa ? `<span class="muted small">+ ${fmtDur(r.pausa)} de pausa</span>` : ''}</div>
       <div class="stat"><span class="muted small">Séries</span><b>${r.feitas}${r.planejadas ? ' / ' + r.planejadas : ''}</b></div>
       <div class="stat"><span class="muted small">Volume</span><b>${fmtKg(Math.round(r.volume))} kg</b></div>
       <div class="stat"><span class="muted small">Recordes</span><b>${r.prs.length}</b></div>
     </div></div>`;
   if (r.prs.length) h += `<div class="card"><b class="pr">🏆 Recordes pessoais</b>${r.prs.map(p => `<div class="mt">${esc(p)}</div>`).join('')}</div>`;
-  h += `<div class="card"><div class="muted small">Exercícios</div>${r.porEx.map(({ ex, w }) => `
-    <div class="li"><span class="grow"><b>${esc(ex.nome)}</b><div class="muted small">${esc(seriesTxt(w)) || '—'}</div></span>
-    <span class="muted small">${w.length}/${ex.series}</span></div>`).join('') || '<p class="muted">Nenhuma série registrada.</p>'}</div>`;
+  h += '<h2>Revise antes de salvar</h2><p class="muted small">Toque numa série para corrigir ou excluir.</p>';
+  h += r.porEx.map(({ ex, w, todas }) => `<div class="card">
+    <div class="row"><b class="grow clamp">${esc(ex.nome)}</b><span class="muted small">${w.length}/${ex.series}${ex.pulado ? ' · pulado' : ''}</span></div>
+    ${todas.map(x => serieLi(x, todas)).join('') || '<div class="muted small mt">Nenhuma série.</div>'}
+    <button class="w100 mt" data-a="modal" data-t="novaSerie" data-k="${ex.key}">+ Série</button></div>`).join('')
+    || '<p class="muted">Nenhum exercício na sessão.</p>';
+  h += `<label class="f">Observação (opcional)</label><textarea id="res-obs" rows="3" style="padding:10px 12px" placeholder="Como foi o treino?">${esc(s.obs || '')}</textarea>`;
   h += `<div class="bottom"><div class="row"><button class="big grow" style="font-size:17px" data-a="continuar">Continuar treinando</button><button class="okb big grow" data-a="concluir">Concluir</button></div></div>`;
   return h;
 }
@@ -971,29 +1104,65 @@ function modalHtml() {
         <b>${esc(e.nome)}</b> ${e.extra ? '<span class="tag warn">extra</span>' : ''}<div class="muted small">${w}/${e.series} séries ${st}</div></button>
         <button data-a="moverEx" data-k="${e.key}" data-d="-1" ${i === 0 ? 'disabled' : ''} aria-label="Subir">↑</button>
         <button data-a="moverEx" data-k="${e.key}" data-d="1" ${i === s.exercicios.length - 1 ? 'disabled' : ''} aria-label="Descer">↓</button>
-        <button data-a="pularEx" data-k="${e.key}">${e.pulado ? 'Retomar' : 'Pular'}</button></div>`;
+        <button data-a="pularEx" data-k="${e.key}">${e.pulado ? 'Retomar' : 'Pular'}</button>
+        <button data-a="modal" data-t="exEdit" data-k="${e.key}" aria-label="Editar ${esc(e.nome)}">✎</button></div>`;
     }).join('') + `<button class="pri big w100 mt" data-a="modal" data-t="picker" data-dest="sessao">+ Adicionar exercício</button>
       <button class="ghost big w100 mt" data-a="fecharModal">Fechar</button>`;
   } else if (m.t === 'picker') {
-    c = `<h3>Adicionar exercício</h3><input id="busca" placeholder="Buscar" autocomplete="off">
+    c = `<h3>${m.dest === 'trocar' ? 'Trocar por' : 'Adicionar exercício'}</h3><input id="busca" placeholder="Buscar" autocomplete="off">
       <div class="mt">${exAtivos().map(e => `<button class="li" data-a="pickEx" data-id="${esc(e.exercicio_id)}" data-busca="${esc((e.nome + ' ' + e.grupo_muscular).toLowerCase())}">
         <span class="grow"><b>${esc(e.nome)}</b><div class="muted small">${esc(e.grupo_muscular)} · ${esc(EQUIP[e.equipamento] || '')}</div></span></button>`).join('') || '<p class="muted">Catálogo vazio.</p>'}</div>
-      <button class="ghost big w100 mt" data-a="fecharModal">Fechar</button>`;
+      <button class="ghost big w100 mt" data-a="${m.dest === 'trocar' ? 'voltarModal' : 'fecharModal'}">${m.dest === 'trocar' ? 'Voltar' : 'Fechar'}</button>`;
+  } else if (m.t === 'exEdit' && s) {
+    const ex = m.novo ? null : s.exercicios.find(e => e.key === m.k);
+    if (!m.novo && !ex) { S.ui.modal = null; return ''; }
+    if (!m.draft) m.draft = { exercicio_id: ex.exercicio_id, series: ex.series, reps_min: ex.reps_min, reps_max: ex.reps_max, descanso_s: ex.descanso_s, plano: prefAplicarPlano() };
+    const d = m.draft, nS = ex ? seriesDoEx(ex).length : 0;
+    const campo = (rot, k) => `<label>${rot}<input data-ed="${k}" inputmode="numeric" value="${esc(d[k])}"></label>`;
+    c = `<h3>${m.novo ? 'Adicionar exercício' : 'Editar exercício'}</h3>
+      <button class="li" data-a="trocarEx" ${nS ? 'disabled' : ''}><span class="grow"><b>${esc(nomeEx(d.exercicio_id))}</b></span><span class="muted small">${nS ? '' : 'trocar ›'}</span></button>
+      ${nS ? `<div class="muted small">Já tem ${nS} série${nS > 1 ? 's' : ''} registrada${nS > 1 ? 's' : ''}; para trocar o exercício, adicione outro ou exclua este.</div>` : ''}
+      <div class="grid4 mt">${campo('Séries', 'series')}${campo('Reps mín', 'reps_min')}${campo('Reps máx', 'reps_max')}${campo('Descanso s', 'descanso_s')}</div>
+      ${s.plano_id ? `<label class="row mt"><input type="checkbox" id="ed-plano" style="width:24px;min-height:24px;flex:none" ${d.plano ? 'checked' : ''}>
+        <span>Aplicar também ao plano “${esc(s.plano_nome)}”</span></label>
+        <div class="muted small">${d.plano ? 'O plano muda para os próximos treinos.' : 'Vale só para este treino.'}</div>` : ''}
+      <div class="row mt">${m.novo ? '' : `<button class="danger grow" data-a="excluirExSessao" data-k="${ex.key}">Excluir</button>`}
+        <button class="okb grow" data-a="salvarExEdit">${m.novo ? 'Adicionar' : 'Salvar'}</button></div>
+      <button class="ghost big w100 mt" data-a="fecharModal">Cancelar</button>`;
   } else if (m.t === 'serie' && s) {
     const x = s.series.find(y => y.serie_id === m.id);
     if (!x) { S.ui.modal = null; return ''; }
-    c = `<h3>Editar série</h3>
-      <div class="grid4" style="grid-template-columns:1fr 1fr 1fr">
-        <label>Peso (kg)<input id="m-peso" inputmode="decimal" value="${fmtKg(x.peso_kg)}"></label>
-        <label>Reps<input id="m-reps" inputmode="numeric" value="${x.reps}"></label>
-        <label>RIR<select id="m-rir"><option value="">—</option>${[0, 1, 2, 3, 4].map(v => `<option ${x.rir === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
-      </div>
-      <label class="row mt"><input type="checkbox" id="m-aq" style="width:24px;min-height:24px" ${x.aquecimento ? 'checked' : ''}> Aquecimento</label>
+    c = `<h3>Editar série</h3><div class="muted small">${esc(x.ex_key && (s.exercicios.find(e => e.key === x.ex_key) || {}).nome || nomeEx(x.exercicio_id))}</div>
+      ${camposSerie(x)}
       ${x.descanso_real_s != null ? `<p class="muted small">Descanso depois desta série: ${fmtDur(x.descanso_real_s)}</p>` : ''}
       <div class="row mt"><button class="danger grow" data-a="excluirSerie" data-id="${x.serie_id}">Excluir</button><button class="okb grow" data-a="salvarSerie" data-id="${x.serie_id}">Salvar</button></div>
       <button class="ghost big w100 mt" data-a="fecharModal">Cancelar</button>`;
+  } else if (m.t === 'novaSerie' && s) {
+    const ex = s.exercicios.find(e => e.key === m.k);
+    if (!ex) { S.ui.modal = null; return ''; }
+    const w = trabalhoDoEx(ex), ult = w[w.length - 1];
+    const v = { peso_kg: ult ? ult.peso_kg : ex.sugestao.peso, reps: ult ? ult.reps : ex.sugestao.reps[Math.min(w.length, ex.sugestao.reps.length - 1)], rir: null, aquecimento: false };
+    c = `<h3>Nova série</h3><div class="muted small">${esc(ex.nome)}</div>
+      ${camposSerie(v)}
+      <div class="row mt"><button class="ghost grow" data-a="fecharModal">Cancelar</button><button class="okb grow" data-a="addSerie" data-k="${ex.key}">Adicionar</button></div>`;
   }
   return c ? `<div class="modal-bg" data-a="fecharModal" data-fundo="1"><div class="modal" role="dialog">${c}</div></div>` : '';
+}
+
+function camposSerie(x) {
+  return `<div class="grid4 mt" style="grid-template-columns:1fr 1fr 1fr">
+      <label>Peso (kg)<input id="m-peso" inputmode="decimal" value="${x.peso_kg == null ? '' : fmtKg(x.peso_kg)}"></label>
+      <label>Reps<input id="m-reps" inputmode="numeric" value="${x.reps ?? ''}"></label>
+      <label>RIR<select id="m-rir"><option value="">—</option>${[0, 1, 2, 3, 4].map(v => `<option ${x.rir === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+    </div>
+    <label class="row mt"><input type="checkbox" id="m-aq" style="width:24px;min-height:24px" ${x.aquecimento ? 'checked' : ''}> Aquecimento</label>`;
+}
+
+/** Lê os campos do modal de série; null (com aviso) se inválidos. */
+function lerCamposSerie() {
+  const peso = num($('#m-peso').value), reps = Math.round(num($('#m-reps').value) || 0);
+  if (peso == null || peso < 0 || reps < 1) { toast('Peso e repetições inválidos'); return null; }
+  return { peso, reps, rir: $('#m-rir').value === '' ? null : Number($('#m-rir').value), aquecimento: $('#m-aq').checked };
 }
 
 // ---------------------------------------------------------------- ações
@@ -1003,7 +1172,7 @@ function fecharModal() { S.ui.modal = null; render(); }
 const acoes = {
   ir: el => { S.ui.modal = null; if (location.hash === el.dataset.h) render(); else location.hash = el.dataset.h; },
   voltar: () => history.length > 1 ? history.back() : (location.hash = '#/'),
-  modal: el => abrirModal({ t: el.dataset.t, id: el.dataset.id, dest: el.dataset.dest }),
+  modal: el => abrirModal({ t: el.dataset.t, id: el.dataset.id, dest: el.dataset.dest, k: el.dataset.k }),
   fecharModal: () => fecharModal(),
   iniciar: el => iniciarSessao(el.dataset.id),
   registrar: () => registrarSerie(),
@@ -1023,7 +1192,16 @@ const acoes = {
   },
   rir: el => { const r = garantirRascunho(exAtual()); r.rir = el.dataset.v === '' ? null : Number(el.dataset.v); salvar.sessao(); render(); },
   aquec: () => { const r = garantirRascunho(exAtual()); r.aquecimento = !r.aquecimento; salvar.sessao(); render(); },
-  proxima: () => { pararDescanso(); salvar.sessao(); render(); },
+  proxima: () => { fotografar('Iniciar próxima série'); pararDescanso(); salvar.sessao(); render(); },
+  desfazer: () => desfazer(),
+  pausar: () => {
+    const s = S.sessao;
+    if (!s || s.pausadoEm || s.estado !== 'ativa') return;
+    s.pausadoEm = Date.now();
+    S.ui.modal = null;
+    salvar.sessao(); wake.desligar(); render();
+  },
+  retomar: () => { retomarPausa(); salvar.sessao(); wake.ligar(); audio.liberar(); render(); },
   ajuste: el => {
     const d = S.sessao.descanso;
     if (!d) return;
@@ -1035,15 +1213,17 @@ const acoes = {
     render();
   },
 
-  selEx: el => { const s = S.sessao; s.atualKey = el.dataset.k; s.rascunho = null; salvar.sessao(); fecharModal(); },
+  selEx: el => { const s = S.sessao; if (s.atualKey === el.dataset.k) { fecharModal(); return; } fotografar('Trocar de exercício'); s.atualKey = el.dataset.k; s.rascunho = null; salvar.sessao(); fecharModal(); },
   moverEx: el => {
     const arr = S.sessao.exercicios, i = arr.findIndex(e => e.key === el.dataset.k), j = i + Number(el.dataset.d);
     if (j < 0 || j >= arr.length) return;
+    fotografar('Mover ' + arr[i].nome);
     [arr[i], arr[j]] = [arr[j], arr[i]];
     salvar.sessao(); render();
   },
   pularEx: el => {
     const s = S.sessao, ex = s.exercicios.find(e => e.key === el.dataset.k);
+    fotografar((ex.pulado ? 'Retomar ' : 'Pular ') + ex.nome);
     ex.pulado = !ex.pulado;
     if (ex.pulado && ex.key === s.atualKey) { const p = proximoPendente(s, ex.key); if (p) { s.atualKey = p.key; s.rascunho = null; } }
     salvar.sessao();
@@ -1053,38 +1233,107 @@ const acoes = {
   pickEx: el => {
     const id = el.dataset.id, m = S.ui.modal;
     if (m.dest === 'sessao') {
-      const s = S.sessao;
-      const nx = novoExSessao(id, itemPadrao(), true);
-      const i = s.exercicios.findIndex(e => e.key === s.atualKey);
-      s.exercicios.splice(i + 1, 0, nx);
-      s.atualKey = nx.key; s.rascunho = null;
-      salvar.sessao();
+      S.ui.modal = { t: 'exEdit', novo: true, draft: { exercicio_id: id, ...itemPadrao(), plano: prefAplicarPlano() } };
+      render();
+      return;
+    } else if (m.dest === 'trocar') {
+      m.voltar.draft.exercicio_id = id;
+      S.ui.modal = m.voltar;
+      render();
+      return;
     } else if (m.dest === 'plano' && S.ui.planoDraft) {
       const p = itemPadrao();
       S.ui.planoDraft.itens.push({ item_id: uuid(), plano_id: S.ui.planoDraft.plano.plano_id, exercicio_id: id, ...p, obs: '' });
     }
     fecharModal();
   },
+  trocarEx: () => { S.ui.modal = { t: 'picker', dest: 'trocar', voltar: S.ui.modal }; render(); },
+  voltarModal: () => { S.ui.modal = S.ui.modal.voltar || null; render(); },
+  salvarExEdit: () => {
+    const s = S.sessao, m = S.ui.modal, d = m.draft, v = rascunhoExValido(d);
+    if (!v) return;
+    const noPlano = !!(s.plano_id && d.plano);
+    if (m.novo) {
+      const nx = novoExSessao(d.exercicio_id, v, !noPlano);
+      fotografar('Adicionar ' + nx.nome, noPlano);
+      s.exercicios.splice(s.exercicios.findIndex(e => e.key === s.atualKey) + 1, 0, nx);
+      s.atualKey = nx.key;
+      if (noPlano) inserirNoPlano(s, nx);
+    } else {
+      const ex = s.exercicios.find(e => e.key === m.k), trocou = d.exercicio_id !== ex.exercicio_id;
+      if (trocou && seriesDoEx(ex).length) { toast('Exercício já tem séries; não dá para trocar'); return; }
+      fotografar((trocou ? 'Trocar ' : 'Alterar ') + ex.nome, noPlano);
+      const nx = novoExSessao(d.exercicio_id, v, ex.extra);
+      // Sem troca, mantém "última vez" e o recorde de antes do treino; só a sugestão muda com a nova faixa
+      Object.assign(ex, pick(nx, trocou
+        ? ['exercicio_id', 'nome', 'equipamento', 'incremento', 'series', 'reps_min', 'reps_max', 'descanso_s', 'sugestao', 'ultima', 'recordeAnterior']
+        : ['series', 'reps_min', 'reps_max', 'descanso_s', 'sugestao']));
+      if (noPlano) {
+        const it = ex.item_id && S.cache.itens.find(i => i.item_id === ex.item_id && i.plano_id === s.plano_id);
+        if (it) { gravarItemPlano({ ...it, ...pick(ex, ['exercicio_id', 'series', 'reps_min', 'reps_max', 'descanso_s']) }); salvar.cache(); }
+        else { ex.extra = false; inserirNoPlano(s, ex); }
+      }
+    }
+    recalcPlanejadas(s);
+    s.rascunho = null;
+    salvar.sessao();
+    toast(noPlano ? 'Salvo no treino e no plano' : 'Salvo só neste treino');
+    fecharModal();
+  },
+  excluirExSessao: el => {
+    const s = S.sessao, ex = s.exercicios.find(e => e.key === el.dataset.k), ss = seriesDoEx(ex);
+    if (ss.length && !confirm(`Excluir ${ex.nome} e ${ss.length > 1 ? 'suas ' + ss.length + ' séries' : 'a série registrada'}?`)) return;
+    const noPlano = !!(s.plano_id && S.ui.modal.draft && S.ui.modal.draft.plano && ex.item_id);
+    fotografar('Excluir ' + ex.nome, noPlano);
+    ss.forEach(x => enfileirarOp('delete', 'Series', x.serie_id));
+    s.series = s.series.filter(x => x.ex_key !== ex.key);
+    if (s.descanso && ss.some(x => x.serie_id === s.descanso.serie_id)) s.descanso = null;
+    if (s.atualKey === ex.key) { const p = proximoPendente(s, ex.key); s.atualKey = p ? p.key : null; }
+    s.exercicios = s.exercicios.filter(e => e.key !== ex.key);
+    if (!s.atualKey && s.exercicios[0]) s.atualKey = s.exercicios[0].key;
+    if (noPlano) {
+      S.cache.itens = S.cache.itens.filter(i => i.item_id !== ex.item_id);
+      enfileirarOp('delete', 'PlanoItens', ex.item_id);
+      salvar.cache();
+    }
+    recalcPlanejadas(s);
+    s.rascunho = null;
+    salvar.sessao();
+    S.ui.modal = null;
+    toast(noPlano ? 'Excluído do treino e do plano' : 'Excluído deste treino');
+    if (deveAutoFinalizar(s)) { pararDescanso(false); finalizar('auto'); return; }
+    render();
+  },
   salvarSerie: el => {
+    const v = lerCamposSerie();
+    if (!v) return;
+    fotografar('Editar série');
     const x = S.sessao.series.find(y => y.serie_id === el.dataset.id);
-    const peso = num($('#m-peso').value), reps = Math.round(num($('#m-reps').value) || 0);
-    if (peso == null || peso < 0 || reps < 1) { toast('Peso e repetições inválidos'); return; }
-    Object.assign(x, { peso_kg: peso, reps, rir: $('#m-rir').value === '' ? null : Number($('#m-rir').value), aquecimento: $('#m-aq').checked });
+    Object.assign(x, { peso_kg: v.peso, reps: v.reps, rir: v.rir, aquecimento: v.aquecimento });
     enfileirarOp('upsert', 'Series', x.serie_id, pick(x, ['peso_kg', 'reps', 'rir', 'aquecimento']));
     salvar.sessao(); fecharModal();
   },
   excluirSerie: el => {
-    if (!confirm('Excluir esta série?')) return;
     const s = S.sessao;
+    fotografar('Excluir série');
     s.series = s.series.filter(y => y.serie_id !== el.dataset.id);
     if (s.descanso && s.descanso.serie_id === el.dataset.id) s.descanso = null;
     enfileirarOp('delete', 'Series', el.dataset.id);
     s.rascunho = null;
     salvar.sessao(); fecharModal();
+    toast('Série excluída — ↶ desfaz');
+  },
+  addSerie: el => {
+    const s = S.sessao, ex = s.exercicios.find(e => e.key === el.dataset.k), v = lerCamposSerie();
+    if (!ex || !v) return;
+    fotografar('Adicionar série — ' + ex.nome);
+    criarSerie(ex, v);
+    salvar.sessao(); fecharModal();
   },
   encerrar: () => {
     if (!confirm('Encerrar o treino agora?')) return;
     S.ui.modal = null;
+    fotografar('Encerrar treino');
     pararDescanso(false);
     finalizar('manual');
   },
@@ -1098,6 +1347,8 @@ const acoes = {
   },
   continuar: () => {
     const s = S.sessao;
+    fotografar('Continuar treinando');
+    s.pausaTotal = (s.pausaTotal || 0) + (Date.now() - s.fim); // o tempo no resumo não conta como treino
     s.estado = 'ativa'; s.fim = null; s.encerramento = null;
     salvar.sessao(); wake.ligar(); render();
   },
@@ -1129,7 +1380,7 @@ const acoes = {
     itensDoPlano(p.plano_id).forEach(it => {
       const c = { ...it, item_id: uuid(), plano_id: novo.plano_id };
       S.cache.itens.push(c);
-      enfileirarOp('upsert', 'PlanoItens', c.item_id, pick(c, ['plano_id', 'ordem', 'exercicio_id', 'series', 'reps_min', 'reps_max', 'descanso_s', 'obs']));
+      enfileirarOp('upsert', 'PlanoItens', c.item_id, pick(c, COLS.PlanoItens));
     });
     salvar.cache(); toast('Plano duplicado'); render();
   },
@@ -1165,7 +1416,7 @@ const acoes = {
       it.ordem = k + 1;
       it.plano_id = d.plano.plano_id;
       S.cache.itens.push(it);
-      enfileirarOp('upsert', 'PlanoItens', it.item_id, pick(it, ['plano_id', 'ordem', 'exercicio_id', 'series', 'reps_min', 'reps_max', 'descanso_s', 'obs']));
+      enfileirarOp('upsert', 'PlanoItens', it.item_id, pick(it, COLS.PlanoItens));
     });
     salvar.cache();
     S.ui.planoDraft = null;
@@ -1237,6 +1488,11 @@ document.addEventListener('input', ev => {
     salvar.sessao();
   } else if (t.dataset.pi != null && S.ui.planoDraft) {
     S.ui.planoDraft.itens[Number(t.dataset.pi)][t.dataset.campo] = t.value;
+  } else if (t.dataset.ed && S.ui.modal && S.ui.modal.draft) {
+    S.ui.modal.draft[t.dataset.ed] = t.value;
+  } else if (t.id === 'res-obs' && S.sessao) {
+    S.sessao.obs = t.value;
+    salvar.sessao();
   } else if (t.id === 'f-plano-nome' && S.ui.planoDraft) {
     S.ui.planoDraft.plano.nome = t.value;
   } else if (t.id === 'busca') {
@@ -1247,6 +1503,12 @@ document.addEventListener('input', ev => {
 });
 
 document.addEventListener('change', ev => {
+  if (ev.target.id === 'ed-plano' && S.ui.modal && S.ui.modal.draft) {
+    S.ui.modal.draft.plano = ev.target.checked;
+    LS.set('aplicarNoPlano', ev.target.checked);
+    render();
+    return;
+  }
   if (ev.target.id === 'f-equip' && ev.target.dataset.novo) $('#f-inc').value = fmtKg(INC_PADRAO[ev.target.value]);
 });
 
@@ -1258,7 +1520,7 @@ window.addEventListener('online', () => { S.sync.espera = 0; sincronizar(); });
 window.addEventListener('offline', atualizarBadge);
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
-  if (S.sessao && S.sessao.estado === 'ativa') wake.ligar();
+  if (S.sessao && S.sessao.estado === 'ativa' && !S.sessao.pausadoEm) wake.ligar();
   tick();
   sincronizar();
 });
@@ -1304,6 +1566,20 @@ function rodarTestes() {
   t('não mexe em operação em envio', f.length === 2 && f[0].dados.reps === undefined, f);
   const rec = atualizarRecorde(null, [{ peso_kg: 100, reps: 5 }, { peso_kg: 90, reps: 10 }, { peso_kg: 120, reps: 1, aquecimento: true }], 'x');
   t('recordes ignoram aquecimento', rec.peso.valor === 100 && Math.round(rec.e1rm.valor) === 120, rec);
+  t('tempo ativo desconta pausas', tempoAtivo({ inicio: 0, pausaTotal: 60000 }, 600000) === 540000);
+  t('tempo ativo congela durante a pausa', tempoAtivo({ inicio: 0, pausaTotal: 0, pausadoEm: 300000 }, 900000) === 300000);
+  t('tempo ativo para no fim', tempoAtivo({ inicio: 0, fim: 100000, pausaTotal: 10000 }, 900000) === 90000);
+  const sA = { serie_id: 'a', peso_kg: 40, reps: 10, descanso_real_s: null }, sB = { serie_id: 'b', peso_kg: 40, reps: 9, descanso_real_s: null };
+  let ops = opsParaReverter([sA, sB], [sA], ['peso_kg', 'reps', 'descanso_real_s']);
+  t('desfazer registro apaga a série nova', ops.length === 1 && ops[0].op === 'delete' && ops[0].id === 'b', ops);
+  ops = opsParaReverter([{ ...sA, descanso_real_s: 95 }], [sA], ['peso_kg', 'reps', 'descanso_real_s']);
+  t('desfazer "próxima série" limpa o descanso gravado', ops.length === 1 && ops[0].op === 'upsert' && ops[0].dados.descanso_real_s === null, ops);
+  ops = opsParaReverter([], [sA], ['peso_kg', 'reps']);
+  t('desfazer exclusão recria a série', ops.length === 1 && ops[0].op === 'upsert' && ops[0].dados.reps === 10, ops);
+  t('nada mudou → nenhuma operação', opsParaReverter([sA], [sA], ['peso_kg', 'reps']).length === 0);
+  const iA = { item_id: 'i1', series: 3 }, iB = { item_id: 'i2', series: 4 };
+  ops = opsParaReverter([{ ...iA, series: 5 }, iB], [iA], ['series'], 'item_id');
+  t('desfazer no plano: reverte item alterado e apaga o inserido', ops.length === 2 && ops.some(o => o.op === 'delete' && o.id === 'i2') && ops.some(o => o.op === 'upsert' && o.id === 'i1' && o.dados.series === 3), ops);
 
   const ok = res.filter(r => r.ok).length;
   $('#app').innerHTML = `<div class="top"><h1>Testes</h1><a href="./" class="badge">voltar</a></div>
@@ -1317,7 +1593,7 @@ if (new URLSearchParams(location.search).has('test')) {
 } else {
   if (S.sessao && rota().r !== 'sessao') location.hash = '#/sessao';
   render();
-  if (S.sessao && S.sessao.estado === 'ativa') wake.ligar();
+  if (S.sessao && S.sessao.estado === 'ativa' && !S.sessao.pausadoEm) wake.ligar();
   setInterval(tick, 250);
   setInterval(() => { if (S.fila.length && !S.sync.ocupado) sincronizar(); }, 30000);
   sincronizar().then(() => carregarDados(true));
